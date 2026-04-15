@@ -235,16 +235,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-```
-
----
-
-## 改动汇总
-
-| 位置 | 改动 |
-|------|------|
-| `remove_opt` | RR 遍历改为正确的 `+10` 跳法，RDLEN 从 `data[pos-2:pos]` 直接读取；OPT 移除后同步更新报文中的 `ARCOUNT` 字段 |
-| `build_resp` | 统一使用 `q`（去 OPT 后）操作；`qname_bytes` 现在正确包含末尾 `\x00`；签名去掉无用的 `domain_str` 参数 |
-| `build_resp` | 新增 `qtype != 1` 分支，AAAA 等查询返回空应答而非错误的 A 记录 |
-| `main` | `s.rstrip('.')` 去掉域名末尾可能存在的点，保证 CUSTOM 字典匹配成功 |
-| `main` | `log.error` 加上 `exc_info=True`，出错时打印完整堆栈方便排查 |
