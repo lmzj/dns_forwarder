@@ -3,7 +3,7 @@ Description=DNS Forwarder
 After=network.target
 
 [Service]
-ExecStart=/opt/dns_forwarder/dns_forwarder_v2.py
+ExecStart=/usr/bin/python3 /opt/dns_forwarder/dns_forwarder_v2.py
 Restart=always
 User=root
 
