@@ -22,106 +22,171 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s',
     handlers=[logging.FileHandler('/tmp/dns_fwd.log'), logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
+
 def remove_opt(data):
     """Remove EDNS OPT record from DNS message."""
     if len(data) < 12:
         return data
+
     qdcount = struct.unpack('>H', data[4:6])[0]
     ancount = struct.unpack('>H', data[6:8])[0]
     nscount = struct.unpack('>H', data[8:10])[0]
     arcount = struct.unpack('>H', data[10:12])[0]
 
     pos = 12
+
+    # 跳过 Question section
     for _ in range(qdcount):
-        while pos < len(data) and data[pos] != 0:
+        while pos < len(data):
             b = data[pos]
+            if b == 0:
+                pos += 1
+                break
             if b >= 192:
                 pos += 2
                 break
             pos += b + 1
-        else:
-            pos += 1
-        pos += 4
+        pos += 4  # QTYPE + QCLASS
 
-    total_rr = ancount + nscount + arcount
+    # 跳过 Answer / NS section 的所有 RR，修复：固定部分应跳 10 字节
+    total_rr = ancount + nscount
     for _ in range(total_rr):
-        while pos < len(data) and data[pos] != 0:
+        # 跳过 NAME
+        while pos < len(data):
             b = data[pos]
+            if b == 0:
+                pos += 1
+                break
             if b >= 192:
                 pos += 2
                 break
             pos += b + 1
-        else:
-            pos += 1
-        pos += 8
-        if pos >= len(data):
+        # TYPE(2) + CLASS(2) + TTL(4) + RDLEN(2) = 10 字节
+        pos += 10
+        if pos > len(data):
             return data
-        rdlen = struct.unpack('>H', data[pos-2:pos])[0]
+        rdlen = struct.unpack('>H', data[pos - 2:pos])[0]
         pos += rdlen
-        if pos >= len(data):
+        if pos > len(data):
             return data
 
-    while pos < len(data):
-        name_len = data[pos]
-        if name_len == 0 and pos + 11 <= len(data):
-            rtype = struct.unpack('>H', data[pos+1:pos+3])[0]
-            if rtype == 41:
-                rdlen = struct.unpack('>H', data[pos+9:pos+11])[0]
-                opt_end = pos + 11 + rdlen
-                return data[:pos] + data[opt_end:]
+    # 在 Additional section 中查找并移除 OPT record
+    new_arcount = arcount
+    result = data
+    for _ in range(arcount):
+        if pos >= len(result):
             break
-        elif name_len >= 192:
+        rr_start = pos
+        # 跳过 NAME
+        while pos < len(result):
+            b = result[pos]
+            if b == 0:
+                pos += 1
+                break
+            if b >= 192:
+                pos += 2
+                break
+            pos += b + 1
+        # 需要至少 10 字节的固定部分
+        if pos + 10 > len(result):
             break
+        rtype = struct.unpack('>H', result[pos:pos + 2])[0]
+        pos += 10  # TYPE(2) + CLASS(2) + TTL(4) + RDLEN(2)
+        rdlen = struct.unpack('>H', result[pos - 2:pos])[0]
+        rr_end = pos + rdlen
+        if rtype == 41:  # OPT record，直接切掉
+            result = result[:rr_start] + result[rr_end:]
+            new_arcount -= 1
+            pos = rr_start  # 位置回退到切除点继续
         else:
-            pos += name_len + 1
+            pos = rr_end
 
-    return data
+    if new_arcount != arcount:
+        # 更新 ARCOUNT
+        result = result[:10] + struct.pack('>H', new_arcount) + result[12:]
+
+    return result
+
 
 def qname_str(data, start):
     parts = []
     i = start
+    visited = set()
     while i < len(data):
+        if i in visited:
+            break
+        visited.add(i)
         b = data[i]
         if b == 0:
             i += 1
             break
         if b >= 192:
-            ptr = struct.unpack('>H', data[i:i+2])[0] & 0x3FFF
+            ptr = struct.unpack('>H', data[i:i + 2])[0] & 0x3FFF
             suffix, _ = qname_str(data, ptr)
-            parts.append(suffix)
+            if suffix:
+                parts.append(suffix)
             i += 2
             break
-        parts.append(data[i+1:i+1+b].decode('ascii', errors='replace'))
+        parts.append(data[i + 1:i + 1 + b].decode('ascii', errors='replace'))
         i += b + 1
     return '.'.join(parts), i
 
-def build_resp(query, domain_str, ip):
+
+def build_resp(query, ip):
+    """
+    构建 A 记录应答，或对非 A 查询返回 NOERROR 空应答。
+    统一使用 remove_opt 后的 q 操作，避免偏移混乱。
+    """
     q = remove_opt(query)
+
+    # 解析 QNAME，修复：正确包含末尾 0x00
     pos = 12
-    while pos < len(q) and q[pos] != 0:
+    while pos < len(q):
         b = q[pos]
+        if b == 0:
+            pos += 1   # 跳过末尾 0x00，pos 现在指向 0x00 之后
+            break
         if b >= 192:
             pos += 2
             break
         pos += b + 1
-    else:
-        pos += 1
-    qname_bytes = q[12:pos]
-    qtype = struct.unpack('>H', q[pos:pos+2])[0]
-    qclass = struct.unpack('>H', q[pos+2:pos+4])[0]
 
-    resp = query[:2]
-    resp += struct.pack('>H', 0x8180)
-    resp += struct.pack('>H', 1)
-    resp += struct.pack('>H', 1)
-    resp += struct.pack('>H', 0)
-    resp += struct.pack('>H', 0)
+    qname_bytes = q[12:pos]  # 包含末尾 0x00（或压缩指针），结构完整
+
+    if pos + 4 > len(q):
+        return None
+
+    qtype  = struct.unpack('>H', q[pos:pos + 2])[0]
+    qclass = struct.unpack('>H', q[pos + 2:pos + 4])[0]
+
+    # 非 A 查询（如 AAAA、MX 等）返回 NOERROR 空应答，避免客户端解析错误
+    if qtype != 1:
+        resp  = q[:2]                           # Transaction ID
+        resp += struct.pack('>H', 0x8180)       # Flags: QR RD RA
+        resp += struct.pack('>H', 1)            # QDCOUNT
+        resp += struct.pack('>H', 0)            # ANCOUNT = 0
+        resp += struct.pack('>H', 0)            # NSCOUNT
+        resp += struct.pack('>H', 0)            # ARCOUNT
+        resp += qname_bytes
+        resp += struct.pack('>HH', qtype, qclass)
+        return resp
+
+    # A 查询，构建完整 A 记录应答
+    resp  = q[:2]                               # Transaction ID
+    resp += struct.pack('>H', 0x8180)           # Flags: QR RD RA
+    resp += struct.pack('>H', 1)                # QDCOUNT
+    resp += struct.pack('>H', 1)                # ANCOUNT
+    resp += struct.pack('>H', 0)                # NSCOUNT
+    resp += struct.pack('>H', 0)                # ARCOUNT
+    # Question section
     resp += qname_bytes
     resp += struct.pack('>HH', qtype, qclass)
-    resp += struct.pack('>H', 0xC00C)
-    resp += struct.pack('>HHIH', 1, 1, 300, 4)
+    # Answer section
+    resp += struct.pack('>H', 0xC00C)           # NAME: 压缩指针指向 offset 12
+    resp += struct.pack('>HHiH', 1, 1, 300, 4) # TYPE A, CLASS IN, TTL 300, RDLEN 4
     resp += socket.inet_aton(ip)
     return resp
+
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -141,14 +206,16 @@ def main():
                 continue
 
             s, _ = qname_str(data, 12)
+            s = s.rstrip('.')  # 修复：统一去掉末尾的点再做匹配
             log.info(f'Query {addr}: "{s}"')
 
             matched = False
             for domain, ip in CUSTOM.items():
                 if s == domain:
                     log.info(f'LOCAL: {s} -> {ip}')
-                    resp = build_resp(data, s, ip)
-                    sock.sendto(resp, addr)
+                    resp = build_resp(data, ip)
+                    if resp:
+                        sock.sendto(resp, addr)
                     matched = True
                     break
 
@@ -161,8 +228,23 @@ def main():
                     sock.sendto(resp, addr)
                 except socket.timeout:
                     log.error('Upstream timeout')
+
         except Exception as e:
-            log.error(f'Error: {e}')
+            log.error(f'Error: {e}', exc_info=True)
+
 
 if __name__ == '__main__':
     main()
+```
+
+---
+
+## 改动汇总
+
+| 位置 | 改动 |
+|------|------|
+| `remove_opt` | RR 遍历改为正确的 `+10` 跳法，RDLEN 从 `data[pos-2:pos]` 直接读取；OPT 移除后同步更新报文中的 `ARCOUNT` 字段 |
+| `build_resp` | 统一使用 `q`（去 OPT 后）操作；`qname_bytes` 现在正确包含末尾 `\x00`；签名去掉无用的 `domain_str` 参数 |
+| `build_resp` | 新增 `qtype != 1` 分支，AAAA 等查询返回空应答而非错误的 A 记录 |
+| `main` | `s.rstrip('.')` 去掉域名末尾可能存在的点，保证 CUSTOM 字典匹配成功 |
+| `main` | `log.error` 加上 `exc_info=True`，出错时打印完整堆栈方便排查 |
