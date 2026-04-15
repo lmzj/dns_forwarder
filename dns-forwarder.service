@@ -1,0 +1,11 @@
+[Unit]
+Description=DNS Forwarder
+After=network.target
+
+[Service]
+ExecStart=/opt/dns_forwarder/dns_forwarder_v2.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
