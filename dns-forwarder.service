@@ -1,10 +1,12 @@
 [Unit]
 Description=DNS Forwarder
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/bin/python3 /opt/dns_forwarder/dns_forwarder_v2.py
 Restart=always
+RestartSec=5
 User=root
 
 [Install]
